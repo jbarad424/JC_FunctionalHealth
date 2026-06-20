@@ -1,0 +1,132 @@
+# Self-contained Claude model monitor — paste this single file into ANY repo
+# that already has Telegram secrets (e.g. your accountant repo) at:
+#   .github/workflows/telegram-model-monitor.yml
+#
+# It reuses your existing Telegram secrets (tries common names automatically),
+# pings Telegram when a NEW Claude model appears, and needs no extra files.
+# Optional: add an ANTHROPIC_API_KEY secret for authoritative detection.
+#
+# Verify once with: Actions -> "Claude model monitor" -> Run workflow -> test = true
+
+name: Claude model monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"        # every ~5 min (GitHub's cron minimum)
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test Telegram message and exit"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write                 # to commit the tiny baseline state file
+
+concurrency:
+  group: claude-model-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check for new Claude models
+        env:
+          # Reuses whatever your repo already has — unset ones are just empty.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TEST: ${{ github.event.inputs.test }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request, urllib.parse
+          TOK  = next((os.environ[k] for k in ("TELEGRAM_BOT_TOKEN","TELEGRAM_TOKEN","BOT_TOKEN") if os.environ.get(k)), "")
+          CHAT = next((os.environ[k] for k in ("TELEGRAM_CHAT_ID","CHAT_ID","TELEGRAM_CHAT") if os.environ.get(k)), "")
+          KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+          STATE = ".github/model-monitor-state.json"
+          FAMILIES = {"opus", "sonnet", "haiku", "fable", "mythos"}
+
+          def get(url, headers=None):
+              req = urllib.request.Request(url, headers=headers or {})
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  return r.read().decode("utf-8", "replace")
+
+          def telegram(text):
+              if not (TOK and CHAT):
+                  print("!! No Telegram token/chat id found in secrets — message not sent.")
+                  return
+              data = urllib.parse.urlencode({"chat_id": CHAT, "text": text}).encode()
+              urllib.request.urlopen(
+                  urllib.request.Request(f"https://api.telegram.org/bot{TOK}/sendMessage", data=data),
+                  timeout=20).read()
+              print("Telegram message sent.")
+
+          if str(os.environ.get("TEST", "")).lower() == "true":
+              telegram("✅ Claude model monitor is wired up. You'll be pinged when a new model appears.")
+              raise SystemExit(0)
+
+          def current_models():
+              found = set()
+              if KEY:
+                  try:
+                      d = json.loads(get("https://api.anthropic.com/v1/models?limit=1000",
+                                         {"x-api-key": KEY, "anthropic-version": "2023-06-01"}))
+                      found |= {m["id"] for m in d.get("data", []) if m.get("id")}
+                  except Exception as e:
+                      print("API source error:", e)
+              try:
+                  body = get("https://platform.claude.com/docs/en/about-claude/models/overview").lower()
+                  for m in re.findall(r"claude-[a-z0-9]+(?:-[a-z0-9]+)*", body):
+                      p = m.split("-")
+                      if len(p) > 1 and p[1] in FAMILIES and "and" not in p and p[-1] not in ("v1", "v1:0"):
+                          found.add(m)
+              except Exception as e:
+                  print("Docs-page source error:", e)
+              return found
+
+          cur = current_models()
+          print(f"Detected {len(cur)} models.")
+          if not cur:
+              print("No models detected; skipping to avoid a bad baseline.")
+              raise SystemExit(0)
+
+          try:
+              st = json.load(open(STATE))
+          except FileNotFoundError:
+              st = {}
+          known = set(st.get("known", []))
+
+          if not st.get("seeded"):
+              json.dump({"seeded": True, "known": sorted(cur)}, open(STATE, "w"), indent=2)
+              print("Baseline seeded. Future new models will alert.")
+              raise SystemExit(0)
+
+          new = sorted(cur - known)
+          if new:
+              telegram("🚀 New Claude model available:\n" + "\n".join("• " + m for m in new)
+                       + "\n\nhttps://platform.claude.com/docs/en/about-claude/models/overview")
+              json.dump({"seeded": True, "known": sorted(known | cur)}, open(STATE, "w"), indent=2)
+          else:
+              print("No new models.")
+          PY
+      - name: Persist baseline
+        if: ${{ always() && github.event.inputs.test != 'true' }}
+        run: |
+          if ! git diff --quiet -- .github/model-monitor-state.json 2>/dev/null; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .github/model-monitor-state.json
+            git commit -m "chore: update Claude model monitor baseline [skip ci]"
+            git push
+          else
+            echo "No state change."
+          fi
