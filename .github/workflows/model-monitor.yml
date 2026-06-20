@@ -1,0 +1,70 @@
+name: Claude model monitor
+
+# Alerts (via Telegram) when a NEW Claude model appears that wasn't there before.
+#
+# IMPORTANT: GitHub only runs `schedule:` triggers from the repository's DEFAULT
+# branch. Merge this workflow to the default branch for the cron to start firing.
+# The cron minimum granularity is ~5 minutes (and GitHub may delay it under load),
+# so this is not a true 60-second monitor. For exact 60s checks, run the script
+# with `--watch` on an always-on machine (see README).
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"      # every 5 minutes
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to do"
+        type: choice
+        default: check
+        options: [check, test, list]
+
+permissions:
+  contents: write               # needed to commit the baseline/state file
+
+concurrency:
+  group: model-monitor
+  cancel-in-progress: false     # never interrupt a state-committing run
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run monitor
+        env:
+          # --- Notification channel (Telegram) ---
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # --- Optional second channel (Pushover) ---
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+          # --- Detection (optional but recommended: authoritative model list) ---
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # --- Optional narrowing: only alert for ids containing this text ---
+          WATCH_FILTER: ${{ vars.WATCH_FILTER }}
+        run: |
+          MODE="${{ github.event.inputs.mode || 'check' }}"
+          case "$MODE" in
+            test) python model_monitor.py --test ;;
+            list) python model_monitor.py --list ;;
+            *)    python model_monitor.py --once ;;
+          esac
+
+      - name: Persist baseline/state
+        if: ${{ always() && (github.event.inputs.mode == 'check' || github.event.inputs.mode == '') }}
+        run: |
+          if ! git diff --quiet -- state/ 2>/dev/null; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state/
+            git commit -m "chore: update model monitor baseline [skip ci]"
+            git push
+          else
+            echo "No state change to commit."
+          fi
