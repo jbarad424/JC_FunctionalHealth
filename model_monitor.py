@@ -75,6 +75,13 @@ WATCH_FILTER = os.environ.get("WATCH_FILTER", "").strip()
 # Alert with the full model list on the very first (baseline) run?
 SEED_NOTIFY = os.environ.get("SEED_NOTIFY", "0").strip() not in ("0", "false", "False", "")
 
+# A previously-known model must be absent this many consecutive checks before
+# it's treated as really offline (debounce against transient API blips). When
+# it later returns, it counts as new again and re-alerts.
+OFFLINE_CONFIRM = max(1, int(os.environ.get("OFFLINE_CONFIRM", "2")))
+# Also send an alert when a model goes offline (not just when one appears)?
+NOTIFY_OFFLINE = os.environ.get("NOTIFY_OFFLINE", "1").strip() not in ("0", "false", "False", "")
+
 # --- Telegram (primary channel) ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -290,48 +297,88 @@ def run_once() -> int:
 
     state = load_state()
     known = set(state.get("known", []))
+    missing = dict(state.get("missing", {}))   # id -> consecutive absences
+    history = state.get("history", [])
 
     # First run -> establish the baseline silently (existing models aren't "new").
-    if not known:
-        new_state = {
-            "known": sorted(ids),
-            "seeded_at": now_iso(),
-            "history": [],
-            "watch_filter": WATCH_FILTER,
-        }
-        save_state(new_state)
-        log(f"Baseline seeded with {len(ids)} models. Future new models will alert.")
+    if not state.get("seeded_at"):
+        save_state({
+            "known": sorted(ids), "missing": {}, "seeded_at": now_iso(),
+            "history": [], "watch_filter": WATCH_FILTER,
+        })
+        log(f"Baseline seeded with {len(ids)} models. Future new/returning models will alert.")
         if SEED_NOTIFY:
             notify("📋 Model monitor baseline set",
-                   f"Now watching {len(ids)} models. You'll be alerted when a new one appears.\n"
+                   f"Now watching {len(ids)} models. You'll be alerted when one appears, returns, or drops.\n"
                    + "\n".join(f"• {m}" for m in sorted(ids)))
         return 0
 
-    new_ids = sorted(ids - known)
-    if not new_ids:
-        log("No new models. State left untouched.")
+    ever_seen = {
+        i for h in history for i in (h.get("appeared", []) + h.get("went_offline", []))
+    } | known | set(missing)
+
+    # --- Appeared: in the list but not currently counted as known ---
+    appeared = sorted(ids - known)
+    # --- Disappeared: known but not in the list this cycle (bump absence count) ---
+    for mid in known - ids:
+        missing[mid] = missing.get(mid, 0) + 1
+    # Present known models reset their absence counter.
+    for mid in known & ids:
+        missing.pop(mid, None)
+    # Confirm offline only after enough consecutive absences (debounce).
+    went_offline = sorted(m for m, c in missing.items() if c >= OFFLINE_CONFIRM)
+
+    changed = bool(appeared or went_offline) or missing != dict(state.get("missing", {}))
+    if not changed:
+        log("No change (all known models present). State left untouched.")
         return 0
 
-    alert_ids = [m for m in new_ids if _passes_filter(m)]
-    log(f"New model id(s) detected: {new_ids}"
-        + (f"; matching filter '{WATCH_FILTER}': {alert_ids}" if WATCH_FILTER else ""))
-
     exit_code = 0
-    if alert_ids:
-        title = "🚀 New Claude model detected!"
-        message = (
-            ("A new Claude model is available:\n" if len(alert_ids) > 1 else "A new Claude model is available:\n")
-            + "\n".join(f"• {m}" for m in alert_ids)
-            + f"\n\nTime: {now_iso()}\nDocs: {DOCS_URL}"
-        )
-        if not notify(title, message):
-            exit_code = 2  # surface send failure to the scheduler
 
-    # Fold everything we now see into the baseline so each model alerts once.
-    history = state.get("history", [])
-    history.append({"detected_at": now_iso(), "new_ids": new_ids, "alerted_ids": alert_ids})
+    # Build the new baseline: add everything present, drop confirmed-offline.
+    new_known = (known | ids) - set(went_offline)
+    for mid in went_offline:
+        missing.pop(mid, None)
+
+    # --- Alert: appeared / returned ---
+    appeared_alert = [m for m in appeared if _passes_filter(m)]
+    if appeared_alert:
+        returning = [m for m in appeared_alert if m in ever_seen]
+        brand_new = [m for m in appeared_alert if m not in ever_seen]
+        lines = []
+        if brand_new:
+            lines.append("🚀 New Claude model available:")
+            lines += [f"• {m}" for m in brand_new]
+        if returning:
+            if lines:
+                lines.append("")
+            lines.append("🔁 Model back online:")
+            lines += [f"• {m}" for m in returning]
+        title = "🚀 New Claude model!" if brand_new else "🔁 Claude model back online"
+        msg = "\n".join(lines) + f"\n\nTime: {now_iso()}\nDocs: {DOCS_URL}"
+        if not notify(title, msg):
+            exit_code = 2
+
+    # --- Alert: went offline ---
+    offline_alert = [m for m in went_offline if _passes_filter(m)]
+    if offline_alert and NOTIFY_OFFLINE:
+        msg = ("⚠️ Claude model no longer available:\n"
+               + "\n".join(f"• {m}" for m in offline_alert)
+               + f"\n\n(Absent for {OFFLINE_CONFIRM}+ checks.)\nTime: {now_iso()}")
+        if not notify("⚠️ Claude model offline", msg):
+            exit_code = 2
+
+    log(f"appeared={appeared} (alerted {appeared_alert}); "
+        f"offline={went_offline} (alerted {offline_alert if NOTIFY_OFFLINE else []})")
+
+    history.append({
+        "at": now_iso(),
+        "appeared": appeared,
+        "went_offline": went_offline,
+    })
     save_state({
-        "known": sorted(known | ids),
+        "known": sorted(new_known),
+        "missing": missing,
         "seeded_at": state.get("seeded_at"),
         "history": history[-50:],
         "watch_filter": WATCH_FILTER,

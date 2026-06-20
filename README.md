@@ -27,6 +27,25 @@ On the **first run** it seeds the baseline silently (everything that already
 exists isn't "new"). On later runs it diffs and alerts on additions, then folds
 them into the baseline so you're alerted **exactly once** per model.
 
+### On / off / back-on
+
+It also tracks availability transitions:
+
+- a known model **disappears** → after `OFFLINE_CONFIRM` consecutive missing
+  checks (default 2, to ignore blips) you get a **⚠️ offline** alert;
+- it **comes back** → you get a **🔁 back online** alert (a fresh appearance is
+  a **🚀 new** alert).
+
+This up/down signal is only meaningful from the **Anthropic API** source (the
+public docs page basically never drops a model), so set `ANTHROPIC_API_KEY` if
+you care about "Fable 5 went down / came back on". Set `NOTIFY_OFFLINE=0` to get
+only the "came back / new" alerts without the offline ones.
+
+> **Reusing an existing Telegram bot:** you don't need a new bot. Use the same
+> `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` from another project — one bot can
+> message you from any number of repos. Just add those same two values as
+> secrets here.
+
 ---
 
 ## Option A — Run on GitHub Actions (free, ~5 min, no machine of your own)
@@ -102,6 +121,8 @@ A single `--once` run is also cron-friendly if you'd rather use your own cron.
 | `MODEL_FAMILIES` | `opus,sonnet,haiku,fable,mythos` | Families trusted from the docs page |
 | `PUBLIC_MODELS_URL` | Anthropic models overview | Page scraped for the fallback source |
 | `STATE_FILE` | `state/known_models.json` | Where the baseline is stored |
+| `OFFLINE_CONFIRM` | `2` | Consecutive missing checks before a model counts as offline |
+| `NOTIFY_OFFLINE` | `1` | Set `0` to skip "went offline" alerts (keep new/back-online) |
 | `SEED_NOTIFY` | `0` | Set `1` to also send the full list on the first (baseline) run |
 | `INTERVAL` | `60` | Default seconds between checks in `--watch` |
 
